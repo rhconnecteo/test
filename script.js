@@ -4,7 +4,7 @@
     var currentFacingMode = 'environment'; // caméra arrière par défaut
     var isBusy = false; // vrai pendant le traitement d'un scan (évite les doublons)
     var selectedMode = 'entree';
-    var API_URL = (typeof window !== 'undefined' && window.API_URL) || '';
+    var API_URL = (typeof window !== 'undefined' && window.API_URL) || 'https://script.google.com/macros/s/AKfycbx5QmKP2EffNwzLXfd5nx7Ztr9Qsn0ALfQbpyZhgKRxfAbTlqmgJgKOjO9iekc-xAZR/exec';
     var config = { fps: 12, qrbox: { width: 250, height: 250 } };
 
     function setMode(mode) {
