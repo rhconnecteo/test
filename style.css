@@ -113,10 +113,16 @@ body {
 
 .scan-tools {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    justify-content: space-between;
-    gap: 10px;
+    gap: 8px;
     margin-top: 10px;
+}
+
+.btn-icon.btn-icon--stop {
+    background: rgba(239, 68, 68, 0.16);
+    border-color: rgba(239,68,68,0.4);
+    color: #fecaca;
 }
 
 .btn-icon {
@@ -140,7 +146,8 @@ body {
     color: rgba(255,255,255,0.7);
     font-size: 0.8rem;
     text-align: right;
-    flex: 1;
+    flex: 1 1 auto;
+    min-width: 100px;
 }
 
 /* ============================================

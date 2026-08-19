@@ -1,486 +1,258 @@
-// ============================================
-// CONFIGURATION
-// ============================================
-var CONFIG = {
-  SPREADSHEET_ID: '1JEWXzPYwZ60HWzFB0_BZJcBYmm0QQD29shP23WQ6BVg',
-  EMPLOYEE_SHEET_NAME: 'Employe',
-  PRESENCE_SHEET_NAME: 'Fiche de présence',
-  TIMEZONE: 'Africa/Nairobi'
-};
+// Frontend pour API Apps Script uniquement (fetch, pas de google.script.run).
+;(function () {
+    var html5QrCode = null;
+    var currentFacingMode = 'environment'; // caméra arrière par défaut
+    var isBusy = false; // vrai pendant le traitement d'un scan (évite les doublons)
+    var selectedMode = 'entree';
+    var API_URL = (typeof window !== 'undefined' && window.API_URL) || '';
+    var config = { fps: 12, qrbox: { width: 250, height: 250 } };
 
-// ============================================
-// doGet / doPost — API JSON uniquement
-// (le frontend est un site statique séparé : index.html + style.css + script.js,
-//  qui appelle cette URL de déploiement via fetch())
-// ============================================
-function doGet(e) {
-  return handleApiRequest(e);
-}
-
-function doPost(e) {
-  return handleApiRequest(e);
-}
-
-function doOptions(e) {
-  return createCorsResponse({ success: true, message: 'CORS preflight OK' });
-}
-
-function handleApiRequest(e) {
-  var params = normalizeRequestData(e);
-  var action = resolveAction(params);
-  var matricule = String(params.matricule || params.codeQr || params.qr || params.code || '').trim();
-
-  if (!action && !matricule) {
-    return createCorsResponse({ success: false, message: 'Aucune action ni matricule fournis.' });
-  }
-
-  try {
-    switch (action) {
-      case 'ping':
-        return createCorsResponse({ success: true, message: 'API OK', date: getTodayDate(), heure: getNowTime(), timezone: CONFIG.TIMEZONE });
-
-      case 'ajouter':
-      case 'ajout':
-        return createCorsResponse(ajouterEmploye(params.matricule, params.nom, params.fonction, params.codeQr || params.code || '-'));
-
-      case 'statut':
-        if (!matricule) return createCorsResponse({ success: false, message: 'Matricule manquant' });
-        var statut = verifierStatut(matricule);
-        return createCorsResponse(statut ? { success: true, data: statut } : { success: false, message: '❌ Matricule non trouvé' });
-
-      case 'entree':
-      case 'checkin':
-        if (!matricule) return createCorsResponse({ success: false, message: 'Matricule manquant' });
-        return createCorsResponse(enregistrerEntree(matricule, params.longitude, params.latitude));
-
-      case 'sortie':
-      case 'checkout':
-        if (!matricule) return createCorsResponse({ success: false, message: 'Matricule manquant' });
-        return createCorsResponse(enregistrerSortie(matricule, params.longitude, params.latitude));
-
-      case 'stats':
-      case 'statistiques':
-        return createCorsResponse(getStatistiques());
-
-      case 'rapport':
-      case 'report':
-        return createCorsResponse({ success: true, data: getRapportDuJour() });
-
-      default:
-        return createCorsResponse({
-          success: false,
-          message: 'Action inconnue.',
-          actions: ['ping', 'ajouter', 'statut', 'entree', 'sortie', 'stats', 'rapport']
+    function setMode(mode) {
+        selectedMode = (mode === 'sortie') ? 'sortie' : 'entree';
+        var buttons = document.querySelectorAll('.mode-btn');
+        buttons.forEach(function (btn) {
+            btn.classList.toggle('active', btn.getAttribute('data-mode') === selectedMode);
         });
     }
-  } catch (error) {
-    console.error('Erreur handleApiRequest:', error);
-    return createCorsResponse({ success: false, message: 'Erreur serveur: ' + error.toString() });
-  }
-}
 
-function normalizeRequestData(e) {
-  var data = {};
-  if (e && e.parameter) {
-    Object.keys(e.parameter).forEach(function (key) { data[key] = e.parameter[key]; });
-  }
-  if (e && e.postData && e.postData.contents) {
-    try {
-      var parsed = JSON.parse(e.postData.contents);
-      if (parsed && typeof parsed === 'object') {
-        Object.keys(parsed).forEach(function (key) { data[key] = parsed[key]; });
-      }
-    } catch (err) { /* JSON invalide, on ignore */ }
-  }
-  return data;
-}
-
-function resolveAction(params) {
-  if (!params) return '';
-  return String(params.action || params.type || params.endpoint || params.mode || '').toLowerCase();
-}
-
-// Note : ContentService ne permet pas de définir des en-têtes CORS custom depuis Apps Script.
-// L'appel fonctionne en simple GET/POST sans en-têtes spéciaux, ce qui évite les erreurs de preflight.
-function createCorsResponse(payload) {
-  var output = ContentService.createTextOutput(JSON.stringify(payload));
-  output.setMimeType(ContentService.MimeType.JSON);
-  return output;
-}
-
-function normalizeText(value) {
-  return String(value == null ? '' : value).trim().replace(/\s+/g, ' ');
-}
-
-// Uniformise une cellule de date (objet Date ou texte) en 'dd/MM/yyyy'.
-function formatCellDate(cell) {
-  if (cell == null || cell === '') return '';
-  if (Object.prototype.toString.call(cell) === '[object Date]') {
-    return Utilities.formatDate(cell, CONFIG.TIMEZONE, 'dd/MM/yyyy');
-  }
-  return String(cell).trim();
-}
-
-function getTodayDate() {
-  return Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'dd/MM/yyyy');
-}
-
-function getNowTime() {
-  return Utilities.formatDate(new Date(), CONFIG.TIMEZONE, 'HH:mm:ss');
-}
-
-// ============================================
-// FEUILLES
-// ============================================
-function getEmployeeSheet() {
-  var ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-  var sheet = ss.getSheetByName(CONFIG.EMPLOYEE_SHEET_NAME);
-  if (!sheet) {
-    sheet = ss.insertSheet(CONFIG.EMPLOYEE_SHEET_NAME);
-    sheet.appendRow(['Matricule', 'Nom et Prénoms', 'Fonction', 'Code QR']);
-  }
-  return sheet;
-}
-
-function getPresenceSheet() {
-  var ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-  var sheet = ss.getSheetByName(CONFIG.PRESENCE_SHEET_NAME);
-  if (!sheet) {
-    sheet = ss.insertSheet(CONFIG.PRESENCE_SHEET_NAME);
-    sheet.appendRow(["Matricule", "Date d'entrée", "Heure d'entrée", "Date de sortie", "Heure de sortie", "Longitude", "Latitude"]);
-  }
-  return sheet;
-}
-
-function findEmployeeRow(key) {
-  try {
-    if (!key) return null;
-    var sheet = getEmployeeSheet();
-    var data = sheet.getDataRange().getValues();
-    var targetLower = normalizeText(key).toLowerCase();
-
-    for (var i = 1; i < data.length; i++) {
-      var row = data[i];
-      var matricule = row[0] ? normalizeText(row[0]) : '';
-      var codeQr = row[3] ? normalizeText(row[3]) : '';
-      if (matricule.toLowerCase() === targetLower || (codeQr && codeQr.toLowerCase() === targetLower)) {
-        return { row: row, index: i };
-      }
-    }
-    return null;
-  } catch (e) {
-    console.error('Erreur findEmployeeRow:', e);
-    return null;
-  }
-}
-
-function getEmployeeByMatricule(matricule) {
-  var found = findEmployeeRow(matricule);
-  if (!found) return null;
-  return { matricule: found.row[0], nom: found.row[1] || '', fonction: found.row[2] || '', codeQr: found.row[3] || '' };
-}
-
-// ============================================
-// STATUT DU JOUR
-// ============================================
-function verifierStatut(matricule) {
-  try {
-    var employee = findEmployeeRow(matricule);
-    if (!employee) return null;
-
-    var sheet = getPresenceSheet();
-    var data = sheet.getDataRange().getValues();
-    var today = getTodayDate();
-    var normalizedMatricule = normalizeText(matricule);
-    var openRow = null;
-
-    for (var i = data.length - 1; i >= 1; i--) {
-      var row = data[i];
-      if (normalizeText(row[0]) !== normalizedMatricule) continue;
-      if (formatCellDate(row[1]) === today && formatCellDate(row[3]) === '') {
-        openRow = row;
-        break;
-      }
+    function getModeLabel() {
+        return selectedMode === 'sortie' ? 'Sortie' : 'Entrée';
     }
 
-    return {
-      matricule: employee.row[0],
-      nom: employee.row[1] || '',
-      fonction: employee.row[2] || '',
-      codeQr: employee.row[3] || '',
-      estPresent: !!openRow,
-      heureEntree: openRow ? (openRow[2] || '') : ''
-    };
-  } catch (error) {
-    console.error('Erreur verifierStatut:', error);
-    return null;
-  }
-}
-
-// ============================================
-// ENTRÉE — écrit dans Date d'entrée / Heure d'entrée.
-// Une seconde entrée le même jour (tant que la sortie n'est pas faite) est bloquée.
-// ============================================
-function enregistrerEntree(matricule, longitude, latitude) {
-  var lock = LockService.getScriptLock();
-  try {
-    lock.waitLock(10000);
-  } catch (e) {
-    return { success: false, message: 'Le système est occupé, réessayez.' };
-  }
-
-  try {
-    if (!matricule) return { success: false, message: 'Matricule manquant' };
-
-    var employee = findEmployeeRow(matricule);
-    if (!employee) return { success: false, message: '❌ Matricule non trouvé dans la base Employé' };
-
-    var sheet = getPresenceSheet();
-    var data = sheet.getDataRange().getValues();
-    var today = getTodayDate();
-    var normalizedMatricule = normalizeText(matricule);
-
-    for (var i = 1; i < data.length; i++) {
-      var row = data[i];
-      if (normalizeText(row[0]) === normalizedMatricule && formatCellDate(row[1]) === today && formatCellDate(row[3]) === '') {
-        return {
-          success: false,
-          message: (employee.row[1] || 'Cette personne') + ' est déjà enregistrée (entrée à ' + (row[2] || '') + ')',
-          matricule: employee.row[0],
-          nom: employee.row[1] || ''
-        };
-      }
+    function updateStatus(text) {
+        var el = document.getElementById('scan-status');
+        if (el) el.textContent = text;
     }
 
-    var now = new Date();
-    var dateStr = Utilities.formatDate(now, CONFIG.TIMEZONE, 'dd/MM/yyyy');
-    var heureStr = Utilities.formatDate(now, CONFIG.TIMEZONE, 'HH:mm:ss');
-    var lonVal = normalizeCoord(longitude);
-    var latVal = normalizeCoord(latitude);
-    sheet.appendRow([employee.row[0], dateStr, heureStr, '', '', lonVal, latVal]);
+    // ============================================
+    // Caméra — API bas niveau Html5Qrcode : démarrage direct, pas de
+    // panneau intermédiaire (permission/select/start) à manipuler.
+    // ============================================
+    function demarrerScanner() {
+        if (typeof Html5Qrcode === 'undefined') {
+            document.getElementById('reader').innerHTML = '<div style="padding:20px;color:#ef4444;text-align:center;">Bibliothèque QR introuvable</div>';
+            afficherPanneCamera();
+            return;
+        }
 
-    return {
-      success: true,
-      message: 'Entrée enregistrée',
-      matricule: employee.row[0],
-      nom: employee.row[1] || '',
-      fonction: employee.row[2] || '',
-      date: dateStr,
-      heure: heureStr,
-      longitude: lonVal,
-      latitude: latVal
-    };
-  } catch (error) {
-    console.error('Erreur enregistrerEntree:', error);
-    return { success: false, message: 'Erreur: ' + error.toString() };
-  } finally {
-    lock.releaseLock();
-  }
-}
+        if (!html5QrCode) {
+            html5QrCode = new Html5Qrcode('reader', /* verbose= */ false);
+        }
 
-// Convertit en nombre valide, ou '' si absent/invalide (coordonnée non fournie).
-function normalizeCoord(value) {
-  if (value === undefined || value === null || value === '') return '';
-  var num = parseFloat(value);
-  return isNaN(num) ? '' : num;
-}
-
-// ============================================
-// SORTIE — écrit dans Date de sortie / Heure de sortie,
-// même si aucune entrée n'a été enregistrée aujourd'hui.
-// ============================================
-function enregistrerSortie(matricule, longitude, latitude) {
-  var lock = LockService.getScriptLock();
-  try {
-    lock.waitLock(10000);
-  } catch (e) {
-    return { success: false, message: 'Le système est occupé, réessayez.' };
-  }
-
-  try {
-    if (!matricule) return { success: false, message: 'Matricule manquant' };
-
-    var employee = findEmployeeRow(matricule);
-    if (!employee) return { success: false, message: '❌ Matricule non trouvé dans la base Employé' };
-
-    var sheet = getPresenceSheet();
-    var data = sheet.getDataRange().getValues();
-    var today = getTodayDate();
-    var normalizedMatricule = normalizeText(matricule);
-    var now = new Date();
-    var dateStr = Utilities.formatDate(now, CONFIG.TIMEZONE, 'dd/MM/yyyy');
-    var heureStr = Utilities.formatDate(now, CONFIG.TIMEZONE, 'HH:mm:ss');
-    var lonVal = normalizeCoord(longitude);
-    var latVal = normalizeCoord(latitude);
-
-    // 1) Ligne d'entrée du jour encore ouverte (sortie vide) -> on la complète.
-    var targetRowIndex = -1;
-    for (var i = data.length - 1; i >= 1; i--) {
-      var row = data[i];
-      if (normalizeText(row[0]) === normalizedMatricule && formatCellDate(row[1]) === today && formatCellDate(row[3]) === '') {
-        targetRowIndex = i + 1;
-        break;
-      }
+        updateStatus('Démarrage de la caméra…');
+        html5QrCode.start({ facingMode: currentFacingMode }, config, onScanSuccess, onScanError)
+            .then(function () {
+                updateStatus('Prêt — présentez un QR code');
+                document.getElementById('permission-info').hidden = true;
+                detecterPlusieursCameras();
+            })
+            .catch(function (err) {
+                handleCameraError(err);
+            });
     }
 
-    if (targetRowIndex !== -1) {
-      sheet.getRange(targetRowIndex, 4).setValue(dateStr);
-      sheet.getRange(targetRowIndex, 5).setValue(heureStr);
-      // On ne remplace la position que si la sortie en fournit une —
-      // sinon on garde celle enregistrée à l'entrée.
-      if (lonVal !== '' && latVal !== '') {
-        sheet.getRange(targetRowIndex, 6).setValue(lonVal);
-        sheet.getRange(targetRowIndex, 7).setValue(latVal);
-      }
-      return {
-        success: true,
-        message: 'Sortie enregistrée',
-        matricule: employee.row[0],
-        nom: employee.row[1] || '',
-        fonction: employee.row[2] || '',
-        date: dateStr,
-        heure: heureStr,
-        longitude: lonVal,
-        latitude: latVal
-      };
+    function detecterPlusieursCameras() {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+        navigator.mediaDevices.enumerateDevices().then(function (devices) {
+            var camCount = devices.filter(function (d) { return d.kind === 'videoinput'; }).length;
+            var btn = document.getElementById('btn-switch-camera');
+            if (btn) btn.hidden = camCount < 2;
+        }).catch(function () {});
     }
 
-    // 2) Pas d'entrée ouverte : on refuse seulement une 2e sortie le même jour.
-    for (var j = data.length - 1; j >= 1; j--) {
-      var rowJ = data[j];
-      if (normalizeText(rowJ[0]) === normalizedMatricule && formatCellDate(rowJ[1]) === today && formatCellDate(rowJ[3]) === today) {
-        return {
-          success: false,
-          message: (employee.row[1] || 'Cette personne') + ' a déjà validé la sortie aujourd\'hui (' + (rowJ[4] || '') + ')',
-          matricule: employee.row[0],
-          nom: employee.row[1] || ''
-        };
-      }
-    }
-
-    // 3) Sinon : sortie seule, entrée laissée vide.
-    sheet.appendRow([employee.row[0], '', '', dateStr, heureStr, lonVal, latVal]);
-
-    return {
-      success: true,
-      message: 'Sortie enregistrée',
-      matricule: employee.row[0],
-      nom: employee.row[1] || '',
-      fonction: employee.row[2] || '',
-      date: dateStr,
-      heure: heureStr,
-      longitude: lonVal,
-      latitude: latVal
-    };
-  } catch (error) {
-    console.error('Erreur enregistrerSortie:', error);
-    return { success: false, message: 'Erreur: ' + error.toString() };
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-// ============================================
-// STATISTIQUES DU JOUR
-// ============================================
-function getStatistiques() {
-  try {
-    var employeeData = getEmployeeSheet().getDataRange().getValues();
-    var total = 0;
-    for (var i = 1; i < employeeData.length; i++) {
-      if (employeeData[i][0] && employeeData[i][0] !== '') total++;
-    }
-
-    var presenceData = getPresenceSheet().getDataRange().getValues();
-    var today = getTodayDate();
-    var present = 0;
-    var seen = {};
-
-    for (var j = 1; j < presenceData.length; j++) {
-      var row = presenceData[j];
-      var matricule = normalizeText(row[0]);
-      if (!matricule) continue;
-      if (formatCellDate(row[1]) === today && formatCellDate(row[3]) === '' && !seen[matricule]) {
-        seen[matricule] = true;
-        present++;
-      }
-    }
-
-    return { success: true, total: total, present: present, absent: total - present, aujourdhui: today };
-  } catch (error) {
-    console.error('Erreur getStatistiques:', error);
-    return { success: false, total: 0, present: 0, absent: 0 };
-  }
-}
-
-// ============================================
-// JOURNAL DU JOUR
-// ============================================
-function getRapportDuJour() {
-  try {
-    var data = getPresenceSheet().getDataRange().getValues();
-    var rapport = [];
-    var today = getTodayDate();
-
-    for (var i = data.length - 1; i >= 1; i--) {
-      var row = data[i];
-      var matricule = normalizeText(row[0]);
-      if (!matricule) continue;
-
-      var dateEntree = formatCellDate(row[1]);
-      var dateSortie = formatCellDate(row[3]);
-
-      if (dateEntree === today || dateSortie === today) {
-        var employee = getEmployeeByMatricule(matricule) || { nom: '', fonction: '' };
-        rapport.push({
-          matricule: matricule,
-          nom: employee.nom || '',
-          fonction: employee.fonction || '',
-          heureEntree: dateEntree === today ? (row[2] || '') : '',
-          heureSortie: dateSortie === today ? (row[4] || '') : '',
-          present: (dateEntree === today && dateSortie === '')
+    function changerCamera() {
+        if (!html5QrCode) return;
+        updateStatus('Changement de caméra…');
+        html5QrCode.stop().then(function () {
+            currentFacingMode = (currentFacingMode === 'environment') ? 'user' : 'environment';
+            demarrerScanner();
+        }).catch(function () {
+            currentFacingMode = (currentFacingMode === 'environment') ? 'user' : 'environment';
+            demarrerScanner();
         });
-      }
-    }
-    return rapport;
-  } catch (error) {
-    console.error('Erreur getRapportDuJour:', error);
-    return [];
-  }
-}
-
-// ============================================
-// AJOUT D'UN COLLABORATEUR
-// ============================================
-function ajouterEmploye(matricule, nom, fonction, codeQr) {
-  try {
-    matricule = String(matricule || '').trim();
-    nom = String(nom || '').trim();
-    fonction = String(fonction || '').trim();
-    codeQr = String(codeQr || '-').trim();
-    var codeQrValide = (codeQr && codeQr !== '-') ? codeQr : '';
-
-    if (!matricule || !nom || !fonction) {
-      return { success: false, message: 'Matricule, nom et fonction sont obligatoires.' };
-    }
-    if (findEmployeeRow(matricule) || (codeQrValide && findEmployeeRow(codeQrValide))) {
-      return { success: false, message: 'Ce collaborateur existe déjà dans la base.' };
     }
 
-    getEmployeeSheet().appendRow([matricule, nom, fonction, codeQr]);
+    function handleCameraError(err) {
+        var s = String((err && err.message) || err || '');
+        updateStatus('Caméra indisponible');
+        afficherPanneCamera();
+        console.debug('Erreur caméra:', s);
+    }
 
-    return { success: true, message: 'Collaborateur ajouté avec succès', matricule: matricule, nom: nom, fonction: fonction, codeQr: codeQr };
-  } catch (error) {
-    console.error('Erreur ajouterEmploye:', error);
-    return { success: false, message: 'Erreur: ' + error.toString() };
-  }
-}
+    function afficherPanneCamera() {
+        var info = document.getElementById('permission-info');
+        if (info) info.hidden = false;
+    }
 
-function testConnexion() {
-  try {
-    var sheet = getEmployeeSheet();
-    return { success: true, message: 'Connexion réussie', nomFeuille: sheet.getName(), nbLignes: sheet.getLastRow() };
-  } catch (error) {
-    return { success: false, message: 'Erreur: ' + error.toString() };
-  }
-}
+    function onScanSuccess(decodedText) {
+        if (isBusy) return; // ignore les détections répétées pendant le traitement en cours
+        isBusy = true;
+
+        try { html5QrCode.pause(true); } catch (e) {}
+        updateStatus('Scan détecté…');
+
+        var matricule = (decodedText || '').toString().split('|')[0].trim() || (decodedText || '').toString().trim();
+        traiterMatricule(matricule, reprendreScanApresDelai);
+    }
+
+    function reprendreScanApresDelai() {
+        setTimeout(function () {
+            try {
+                html5QrCode.resume();
+                updateStatus('Prêt — présentez un QR code');
+            } catch (e) {}
+            isBusy = false;
+        }, 900); // juste assez pour lire le résultat, sans ralentir la file d'attente
+    }
+
+    function onScanError() {
+        // Erreurs de lecture image par image (aucun QR dans le cadre) : ignorées volontairement,
+        // la librairie les déclenche en continu tant qu'elle ne détecte rien — inutile de les traiter.
+    }
+
+    // ============================================
+    // Géolocalisation — on ne demande PLUS la position à chaque scan (ça pouvait
+    // prendre plusieurs secondes et ralentir toute la file d'attente). On la
+    // récupère une seule fois en tâche de fond avec watchPosition() et on
+    // réutilise la dernière valeur connue, lue instantanément à chaque scan.
+    // ============================================
+    var positionActuelle = { longitude: '', latitude: '' };
+    var watchId = null;
+
+    function demarrerSuiviPosition() {
+        if (!navigator.geolocation) return;
+        watchId = navigator.geolocation.watchPosition(
+            function (pos) {
+                positionActuelle = { longitude: pos.coords.longitude, latitude: pos.coords.latitude };
+            },
+            function () { /* refusé ou indisponible : on garde '' et on continue */ },
+            { enableHighAccuracy: false, maximumAge: 60000, timeout: 15000 }
+        );
+    }
+
+    // ============================================
+    // Le mode sélectionné détermine uniquement la colonne visée côté backend.
+    // Entrée -> Date/Heure d'entrée (bloqué si déjà fait aujourd'hui).
+    // Sortie -> Date/Heure de sortie, même sans entrée préalable.
+    // ============================================
+    function traiterMatricule(matricule, onDone) {
+        if (!matricule) {
+            afficherErreur('Veuillez saisir un matricule ou scanner un QR valide.');
+            if (onDone) onDone();
+            return;
+        }
+
+        document.getElementById('result').innerHTML =
+            '<div class="result-card"><div class="result-header"><span id="result-icon">⏳</span>' +
+            '<h2 id="result-title" style="color:#1d4ed8;">Vérification...</h2></div>' +
+            '<div style="color:#1d4ed8; font-weight:600; text-align:center;">Mode : ' + getModeLabel() + '</div></div>';
+
+        var action = selectedMode === 'entree' ? 'entree' : 'sortie';
+
+        callApi(action, matricule, positionActuelle, function (response) {
+            handleResult(response, getModeLabel().toLowerCase());
+            if (onDone) onDone();
+        }, function (error) {
+            afficherErreur('Erreur API: ' + (error && error.message ? error.message : 'Impossible de contacter le backend'));
+            if (onDone) onDone();
+        });
+    }
+
+    function callApi(action, matricule, position, onSuccess, onError) {
+        if (!API_URL) {
+            if (onError) onError({ message: 'Configurez window.API_URL dans index.html.' });
+            return;
+        }
+        var url = API_URL + '?action=' + encodeURIComponent(action) + '&matricule=' + encodeURIComponent(matricule);
+        if (position && position.longitude !== '' && position.latitude !== '') {
+            url += '&longitude=' + encodeURIComponent(position.longitude) + '&latitude=' + encodeURIComponent(position.latitude);
+        }
+        fetch(url, { method: 'GET', headers: { Accept: 'application/json' } })
+            .then(function (response) {
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+                return response.json();
+            })
+            .then(function (data) { if (onSuccess) onSuccess(data || {}); })
+            .catch(function (error) { if (onError) onError(error); });
+    }
+
+    function handleResult(result, type) {
+        if (result && result.success) {
+            afficherSucces(result, type);
+        } else {
+            afficherErreur((result && result.message) ? result.message : 'Erreur inconnue');
+        }
+    }
+
+    function afficherSucces(result, type) {
+        var icon = type === 'entrée' ? '✅' : '🚪';
+        var title = type === 'entrée' ? 'Entrée enregistrée' : 'Sortie enregistrée';
+        var color = type === 'entrée' ? '#166534' : '#991b1b';
+        document.getElementById('result').innerHTML =
+            '<div class="result-card"><div class="result-header"><span id="result-icon">' + icon + '</span>' +
+            '<h2 id="result-title" style="color:' + color + ';">' + title + '</h2></div>' +
+            '<div id="result-content">' +
+            '<div class="info-item"><span class="label">Matricule:</span><span class="value">' + (result.matricule || '') + '</span></div>' +
+            '<div class="info-item"><span class="label">Nom:</span><span class="value">' + (result.nom || '') + '</span></div>' +
+            '<div class="info-item"><span class="label">Date:</span><span class="value">' + (result.date || '') + '</span></div>' +
+            '<div class="info-item"><span class="label">Heure:</span><span class="value">' + (result.heure || '') + '</span></div>' +
+            '</div></div>';
+        afficherToast(result.message || title, 'success');
+    }
+
+    function afficherErreur(message) {
+        var clean = String(message || 'Erreur');
+        document.getElementById('result').innerHTML =
+            '<div class="result-card" style="border:1px solid rgba(239,68,68,0.5); background: rgba(254,242,242,0.92);">' +
+            '<div class="result-header"><span style="font-size:36px">❌</span><h2 style="color:#991b1b; font-size:22px;">Erreur</h2></div>' +
+            '<div style="color:#991b1b; text-align:center; padding:10px; font-weight:600;">' + clean + '</div></div>';
+        afficherToast(clean, 'error');
+    }
+
+    function afficherToast(message, type) {
+        var toast = document.createElement('div');
+        toast.className = 'toast toast-' + type;
+        toast.textContent = message;
+        document.body.appendChild(toast);
+        setTimeout(function () {
+            if (toast.parentNode) toast.parentNode.removeChild(toast);
+        }, 2600);
+    }
+
+    window.onload = function () {
+        setMode('entree');
+        document.querySelectorAll('.mode-btn').forEach(function (btn) {
+            btn.addEventListener('click', function () { setMode(btn.getAttribute('data-mode')); });
+        });
+
+        demarrerSuiviPosition();
+
+        var switchBtn = document.getElementById('btn-switch-camera');
+        if (switchBtn) switchBtn.addEventListener('click', changerCamera);
+
+        var manualForm = document.getElementById('manual-form');
+        if (manualForm) {
+            manualForm.addEventListener('submit', function (evt) {
+                evt.preventDefault();
+                var input = document.getElementById('manual-matricule');
+                var matricule = input.value.trim();
+                if (!matricule) return;
+                traiterMatricule(matricule, function () {});
+                input.value = '';
+            });
+        }
+
+        if (document.getElementById('reader')) {
+            demarrerScanner();
+        }
+    };
+
+    window.onbeforeunload = function () {
+        if (html5QrCode) {
+            try { html5QrCode.stop(); } catch (e) {}
+        }
+        if (watchId !== null && navigator.geolocation) {
+            try { navigator.geolocation.clearWatch(watchId); } catch (e) {}
+        }
+    };
+})();
