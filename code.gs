@@ -51,12 +51,12 @@ function handleApiRequest(e) {
       case 'entree':
       case 'checkin':
         if (!matricule) return createCorsResponse({ success: false, message: 'Matricule manquant' });
-        return createCorsResponse(enregistrerEntree(matricule));
+        return createCorsResponse(enregistrerEntree(matricule, params.longitude, params.latitude));
 
       case 'sortie':
       case 'checkout':
         if (!matricule) return createCorsResponse({ success: false, message: 'Matricule manquant' });
-        return createCorsResponse(enregistrerSortie(matricule));
+        return createCorsResponse(enregistrerSortie(matricule, params.longitude, params.latitude));
 
       case 'stats':
       case 'statistiques':
@@ -147,7 +147,7 @@ function getPresenceSheet() {
   var sheet = ss.getSheetByName(CONFIG.PRESENCE_SHEET_NAME);
   if (!sheet) {
     sheet = ss.insertSheet(CONFIG.PRESENCE_SHEET_NAME);
-    sheet.appendRow(["Matricule", "Date d'entrée", "Heure d'entrée", "Date de sortie", "Heure de sortie"]);
+    sheet.appendRow(["Matricule", "Date d'entrée", "Heure d'entrée", "Date de sortie", "Heure de sortie", "Longitude", "Latitude"]);
   }
   return sheet;
 }
@@ -221,7 +221,7 @@ function verifierStatut(matricule) {
 // ENTRÉE — écrit dans Date d'entrée / Heure d'entrée.
 // Une seconde entrée le même jour (tant que la sortie n'est pas faite) est bloquée.
 // ============================================
-function enregistrerEntree(matricule) {
+function enregistrerEntree(matricule, longitude, latitude) {
   var lock = LockService.getScriptLock();
   try {
     lock.waitLock(10000);
@@ -255,7 +255,9 @@ function enregistrerEntree(matricule) {
     var now = new Date();
     var dateStr = Utilities.formatDate(now, CONFIG.TIMEZONE, 'dd/MM/yyyy');
     var heureStr = Utilities.formatDate(now, CONFIG.TIMEZONE, 'HH:mm:ss');
-    sheet.appendRow([employee.row[0], dateStr, heureStr, '', '']);
+    var lonVal = normalizeCoord(longitude);
+    var latVal = normalizeCoord(latitude);
+    sheet.appendRow([employee.row[0], dateStr, heureStr, '', '', lonVal, latVal]);
 
     return {
       success: true,
@@ -264,7 +266,9 @@ function enregistrerEntree(matricule) {
       nom: employee.row[1] || '',
       fonction: employee.row[2] || '',
       date: dateStr,
-      heure: heureStr
+      heure: heureStr,
+      longitude: lonVal,
+      latitude: latVal
     };
   } catch (error) {
     console.error('Erreur enregistrerEntree:', error);
@@ -274,11 +278,18 @@ function enregistrerEntree(matricule) {
   }
 }
 
+// Convertit en nombre valide, ou '' si absent/invalide (coordonnée non fournie).
+function normalizeCoord(value) {
+  if (value === undefined || value === null || value === '') return '';
+  var num = parseFloat(value);
+  return isNaN(num) ? '' : num;
+}
+
 // ============================================
 // SORTIE — écrit dans Date de sortie / Heure de sortie,
 // même si aucune entrée n'a été enregistrée aujourd'hui.
 // ============================================
-function enregistrerSortie(matricule) {
+function enregistrerSortie(matricule, longitude, latitude) {
   var lock = LockService.getScriptLock();
   try {
     lock.waitLock(10000);
@@ -299,6 +310,8 @@ function enregistrerSortie(matricule) {
     var now = new Date();
     var dateStr = Utilities.formatDate(now, CONFIG.TIMEZONE, 'dd/MM/yyyy');
     var heureStr = Utilities.formatDate(now, CONFIG.TIMEZONE, 'HH:mm:ss');
+    var lonVal = normalizeCoord(longitude);
+    var latVal = normalizeCoord(latitude);
 
     // 1) Ligne d'entrée du jour encore ouverte (sortie vide) -> on la complète.
     var targetRowIndex = -1;
@@ -313,6 +326,12 @@ function enregistrerSortie(matricule) {
     if (targetRowIndex !== -1) {
       sheet.getRange(targetRowIndex, 4).setValue(dateStr);
       sheet.getRange(targetRowIndex, 5).setValue(heureStr);
+      // On ne remplace la position que si la sortie en fournit une —
+      // sinon on garde celle enregistrée à l'entrée.
+      if (lonVal !== '' && latVal !== '') {
+        sheet.getRange(targetRowIndex, 6).setValue(lonVal);
+        sheet.getRange(targetRowIndex, 7).setValue(latVal);
+      }
       return {
         success: true,
         message: 'Sortie enregistrée',
@@ -320,7 +339,9 @@ function enregistrerSortie(matricule) {
         nom: employee.row[1] || '',
         fonction: employee.row[2] || '',
         date: dateStr,
-        heure: heureStr
+        heure: heureStr,
+        longitude: lonVal,
+        latitude: latVal
       };
     }
 
@@ -338,7 +359,7 @@ function enregistrerSortie(matricule) {
     }
 
     // 3) Sinon : sortie seule, entrée laissée vide.
-    sheet.appendRow([employee.row[0], '', '', dateStr, heureStr]);
+    sheet.appendRow([employee.row[0], '', '', dateStr, heureStr, lonVal, latVal]);
 
     return {
       success: true,
@@ -347,7 +368,9 @@ function enregistrerSortie(matricule) {
       nom: employee.row[1] || '',
       fonction: employee.row[2] || '',
       date: dateStr,
-      heure: heureStr
+      heure: heureStr,
+      longitude: lonVal,
+      latitude: latVal
     };
   } catch (error) {
     console.error('Erreur enregistrerSortie:', error);

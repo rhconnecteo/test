@@ -1,9 +1,11 @@
 // Frontend pour API Apps Script uniquement (fetch, pas de google.script.run).
 ;(function () {
-    var scanner = null;
-    var isScanning = false;
+    var html5QrCode = null;
+    var currentFacingMode = 'environment'; // caméra arrière par défaut
+    var isBusy = false; // vrai pendant le traitement d'un scan (évite les doublons)
     var selectedMode = 'entree';
-    var API_URL = (typeof window !== 'undefined' && window.API_URL) || 'https://script.google.com/macros/s/AKfycbwK28laqh7i0dGDpRA9FVyIZwGPQbOieqCeHmFGn7J9_QZUm-GnXKuZUlcX4IrIdriq/exec';
+    var API_URL = (typeof window !== 'undefined' && window.API_URL) || '';
+    var config = { fps: 12, qrbox: { width: 250, height: 250 } };
 
     function setMode(mode) {
         selectedMode = (mode === 'sortie') ? 'sortie' : 'entree';
@@ -17,64 +19,95 @@
         return selectedMode === 'sortie' ? 'Sortie' : 'Entrée';
     }
 
-    function verifierPermissionsCamera() {
-        if (!navigator.permissions) return;
-        navigator.permissions.query({ name: 'camera' }).then(function (r) {
-            if (r.state === 'denied') {
-                afficherPanneCamera();
-            }
-        }).catch(function () {});
+    function updateStatus(text) {
+        var el = document.getElementById('scan-status');
+        if (el) el.textContent = text;
     }
 
-    function afficherPanneCamera() {
-        var info = document.getElementById('permission-info');
-        if (info) info.style.display = 'block';
-    }
-
+    // ============================================
+    // Caméra — API bas niveau Html5Qrcode : démarrage direct, pas de
+    // panneau intermédiaire (permission/select/start) à manipuler.
+    // ============================================
     function demarrerScanner() {
-        if (typeof Html5QrcodeScanner === 'undefined') {
+        if (typeof Html5Qrcode === 'undefined') {
             document.getElementById('reader').innerHTML = '<div style="padding:20px;color:#ef4444;text-align:center;">Bibliothèque QR introuvable</div>';
             afficherPanneCamera();
             return;
         }
-        if (scanner) {
-            try { scanner.clear(); } catch (e) {}
-            scanner = null;
+
+        if (!html5QrCode) {
+            html5QrCode = new Html5Qrcode('reader', /* verbose= */ false);
         }
-        document.getElementById('result').innerHTML = '';
-        document.getElementById('btn-redemarrer').style.display = 'none';
-        try {
-            scanner = new Html5QrcodeScanner('reader', { qrbox: { width: 250, height: 250 }, fps: 20 });
-            scanner.render(onScanSuccess, onScanError);
-            isScanning = true;
-        } catch (e) {
-            document.getElementById('reader').innerHTML = '<div style="padding:20px;color:#ef4444;text-align:center;">Erreur démarrage scanner</div>';
-            afficherPanneCamera();
-        }
+
+        updateStatus('Démarrage de la caméra…');
+        html5QrCode.start({ facingMode: currentFacingMode }, config, onScanSuccess, onScanError)
+            .then(function () {
+                updateStatus('Prêt — présentez un QR code');
+                document.getElementById('permission-info').hidden = true;
+                detecterPlusieursCameras();
+            })
+            .catch(function (err) {
+                handleCameraError(err);
+            });
+    }
+
+    function detecterPlusieursCameras() {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+        navigator.mediaDevices.enumerateDevices().then(function (devices) {
+            var camCount = devices.filter(function (d) { return d.kind === 'videoinput'; }).length;
+            var btn = document.getElementById('btn-switch-camera');
+            if (btn) btn.hidden = camCount < 2;
+        }).catch(function () {});
+    }
+
+    function changerCamera() {
+        if (!html5QrCode) return;
+        updateStatus('Changement de caméra…');
+        html5QrCode.stop().then(function () {
+            currentFacingMode = (currentFacingMode === 'environment') ? 'user' : 'environment';
+            demarrerScanner();
+        }).catch(function () {
+            currentFacingMode = (currentFacingMode === 'environment') ? 'user' : 'environment';
+            demarrerScanner();
+        });
+    }
+
+    function handleCameraError(err) {
+        var s = String((err && err.message) || err || '');
+        updateStatus('Caméra indisponible');
+        afficherPanneCamera();
+        console.debug('Erreur caméra:', s);
+    }
+
+    function afficherPanneCamera() {
+        var info = document.getElementById('permission-info');
+        if (info) info.hidden = false;
     }
 
     function onScanSuccess(decodedText) {
-        if (!isScanning) return;
-        if (scanner) {
-            try { scanner.clear(); } catch (e) {}
-            scanner = null;
-            isScanning = false;
-        }
-        document.getElementById('btn-redemarrer').style.display = 'block';
+        if (isBusy) return; // ignore les détections répétées pendant le traitement en cours
+        isBusy = true;
+
+        try { html5QrCode.pause(true); } catch (e) {}
+        updateStatus('Scan détecté…');
 
         var matricule = (decodedText || '').toString().split('|')[0].trim() || (decodedText || '').toString().trim();
-        traiterMatricule(matricule);
+        traiterMatricule(matricule, reprendreScanApresDelai);
     }
 
-    function onScanError(err) {
-        try {
-            var s = String(err || '');
-            if (s.indexOf('QR code parse error') !== -1 || s.indexOf('No MultiFormat Readers were able') !== -1) return;
-            if (s.indexOf('NotAllowed') !== -1 || s.indexOf('Permission') !== -1 || s.indexOf('NotFound') !== -1) {
-                afficherPanneCamera();
-            }
-        } catch (e) {}
-        console.debug('scan err', err);
+    function reprendreScanApresDelai() {
+        setTimeout(function () {
+            try {
+                html5QrCode.resume();
+                updateStatus('Prêt — présentez un QR code');
+            } catch (e) {}
+            isBusy = false;
+        }, 1400); // le temps de lire le résultat avant de rescanner
+    }
+
+    function onScanError() {
+        // Erreurs de lecture image par image (aucun QR dans le cadre) : ignorées volontairement,
+        // la librairie les déclenche en continu tant qu'elle ne détecte rien — inutile de les traiter.
     }
 
     // ============================================
@@ -90,15 +123,12 @@
             }
             navigator.geolocation.getCurrentPosition(
                 function (pos) {
-                    resolve({
-                        longitude: pos.coords.longitude,
-                        latitude: pos.coords.latitude
-                    });
+                    resolve({ longitude: pos.coords.longitude, latitude: pos.coords.latitude });
                 },
                 function () {
-                    resolve({ longitude: '', latitude: '' }); // refusé / indisponible
+                    resolve({ longitude: '', latitude: '' });
                 },
-                { enableHighAccuracy: true, timeout: 6000, maximumAge: 30000 }
+                { enableHighAccuracy: true, timeout: 4000, maximumAge: 30000 }
             );
         });
     }
@@ -108,9 +138,10 @@
     // Entrée -> Date/Heure d'entrée (bloqué si déjà fait aujourd'hui).
     // Sortie -> Date/Heure de sortie, même sans entrée préalable.
     // ============================================
-    function traiterMatricule(matricule) {
+    function traiterMatricule(matricule, onDone) {
         if (!matricule) {
             afficherErreur('Veuillez saisir un matricule ou scanner un QR valide.');
+            if (onDone) onDone();
             return;
         }
 
@@ -124,8 +155,10 @@
         obtenirPosition().then(function (position) {
             callApi(action, matricule, position, function (response) {
                 handleResult(response, getModeLabel().toLowerCase());
+                if (onDone) onDone();
             }, function (error) {
                 afficherErreur('Erreur API: ' + (error && error.message ? error.message : 'Impossible de contacter le backend'));
+                if (onDone) onDone();
             });
         });
     }
@@ -188,24 +221,17 @@
         document.body.appendChild(toast);
         setTimeout(function () {
             if (toast.parentNode) toast.parentNode.removeChild(toast);
-        }, 3200);
+        }, 2600);
     }
-
-    window.redemarrerScanner = function () {
-        document.getElementById('result').innerHTML = '';
-        document.getElementById('btn-redemarrer').style.display = 'none';
-        if (scanner) {
-            try { scanner.clear(); } catch (e) {}
-            scanner = null;
-        }
-        setTimeout(demarrerScanner, 300);
-    };
 
     window.onload = function () {
         setMode('entree');
         document.querySelectorAll('.mode-btn').forEach(function (btn) {
             btn.addEventListener('click', function () { setMode(btn.getAttribute('data-mode')); });
         });
+
+        var switchBtn = document.getElementById('btn-switch-camera');
+        if (switchBtn) switchBtn.addEventListener('click', changerCamera);
 
         var manualForm = document.getElementById('manual-form');
         if (manualForm) {
@@ -214,12 +240,10 @@
                 var input = document.getElementById('manual-matricule');
                 var matricule = input.value.trim();
                 if (!matricule) return;
-                traiterMatricule(matricule);
+                traiterMatricule(matricule, function () {});
                 input.value = '';
             });
         }
-
-        verifierPermissionsCamera();
 
         if (document.getElementById('reader')) {
             demarrerScanner();
@@ -227,9 +251,8 @@
     };
 
     window.onbeforeunload = function () {
-        if (scanner) {
-            try { scanner.clear(); } catch (e) {}
-            scanner = null;
+        if (html5QrCode) {
+            try { html5QrCode.stop(); } catch (e) {}
         }
     };
 })();
